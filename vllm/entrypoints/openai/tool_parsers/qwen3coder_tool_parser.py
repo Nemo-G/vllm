@@ -128,6 +128,13 @@ class Qwen3CoderToolParser(ToolParser):
         # Known end tokens we need to buffer for
         end_tokens = [self.parameter_end_token, self.function_end_token, self.tool_call_end_token]
         
+        # If we're not buffering, check for complete end tokens first
+        if not self.buffering_xml:
+            for token in end_tokens:
+                if delta_text == token:
+                    # Complete end token, pass through immediately
+                    return delta_text, True
+        
         # If we're not buffering and delta has no special characters, pass through
         if not self.buffering_xml and '<' not in delta_text and '\n' not in delta_text:
             return delta_text, True
@@ -148,13 +155,25 @@ class Qwen3CoderToolParser(ToolParser):
                     self.xml_buffer = ""
                     return result, True
             
-            # Check if we have newline + complete end token (strip the newline)
+            # Check if we have newline + complete end token (preserve the newline)
             for token in end_tokens:
                 if self.xml_buffer == '\n' + token:
-                    # Formatting newline before end token, strip it
+                    # Newline + end token, output both
                     self.buffering_xml = False
+                    result = self.xml_buffer
                     self.xml_buffer = ""
-                    return token, True
+                    return result, True
+            
+            # Quick fail: if buffer is just '<' and new input doesn't start with '/'
+            if self.xml_buffer == '<' and not delta_text.startswith('/'):
+                # Not an end tag, output buffered '<' and process delta normally
+                self.buffering_xml = False
+                buffered_content = self.xml_buffer
+                self.xml_buffer = ""
+                
+                # Process the delta_text normally (it might contain more special chars)
+                delta_result, delta_continue = self._process_xml_buffer(delta_text)
+                return buffered_content + delta_result, delta_continue
             
             # Check if buffer could still become valid
             could_be_valid = False
@@ -168,29 +187,64 @@ class Qwen3CoderToolParser(ToolParser):
                 not self.xml_buffer[1:].startswith('<')):
                 could_be_valid = False
                 
-                # Quick fail detected - output buffer and check delta_text for more newlines
+                # Quick fail detected - need to handle additional newlines in the input
                 self.buffering_xml = False
-                buffered_output = self.xml_buffer
+                
+                # Find where the original buffer ended and new delta started
+                original_buffer_len = len(self.xml_buffer) - len(delta_text)
+                buffered_part = self.xml_buffer[:original_buffer_len]  # Just the original "\n"
+                delta_part = self.xml_buffer[original_buffer_len:]     # The new delta_text
+                
                 self.xml_buffer = ""
                 
-                # Check if delta_text (which is already in buffer) has more newlines to process
-                remaining_text = self.xml_buffer  # This would be empty since we just cleared it
-                # We need to extract the delta_text portion that was just added
-                # Since delta_text was added to buffer, we need to process it separately
-                
-                # For now, output the buffer - the delta_text will be processed in next call
-                return buffered_output, True
+                # Check if delta_part contains newlines that need new buffering
+                if '\n' in delta_part:
+                    newline_pos = delta_part.find('\n')
+                    content_before_newline = delta_part[:newline_pos]
+                    content_from_newline = delta_part[newline_pos:]
+                    
+                    # Output buffered newline + content before new newline
+                    output_result = buffered_part + content_before_newline
+                    
+                    # Start new buffering from the newline
+                    self.buffering_xml = True
+                    self.xml_buffer = content_from_newline
+                    
+                    return output_result, len(output_result) > 0
+                else:
+                    # No additional newlines, output everything
+                    return buffered_part + delta_part, True
             
             max_reasonable_len = max(len(token) for token in end_tokens) + 2  # +2 for newline + some margin
             if could_be_valid and len(self.xml_buffer) <= max_reasonable_len:
                 # Keep buffering
                 return "", False
             else:
-                # Buffer is invalid or too long, output it
+                # Buffer is invalid or too long
                 self.buffering_xml = False
-                result = self.xml_buffer
-                self.xml_buffer = ""
-                return result, True
+                
+                # Check if this is due to invalid XML structure (not newline-related)
+                if not could_be_valid and not self.xml_buffer.startswith('\n'):
+                    # Extract original buffer and new delta
+                    original_buffer_len = len(self.xml_buffer) - len(delta_text)
+                    original_buffer = self.xml_buffer[:original_buffer_len]
+                    
+                    # Check if new delta should start new buffering
+                    if '<' in delta_text or '\n' in delta_text:
+                        # Start new buffering with the delta
+                        self.buffering_xml = True
+                        self.xml_buffer = delta_text
+                        return original_buffer, len(original_buffer) > 0
+                    else:
+                        # No special chars in delta, output everything
+                        result = self.xml_buffer
+                        self.xml_buffer = ""
+                        return result, True
+                else:
+                    # Output entire buffer for other cases (too long, etc.)
+                    result = self.xml_buffer
+                    self.xml_buffer = ""
+                    return result, True
         
         # Not currently buffering - check if we need to start
         if '\n' in delta_text:
@@ -211,11 +265,23 @@ class Qwen3CoderToolParser(ToolParser):
             lt_pos = delta_text.find('<')
             output_content = delta_text[:lt_pos]
             
-            # Start buffering from '<'
-            self.buffering_xml = True
-            self.xml_buffer = delta_text[lt_pos:]
-            
-            return output_content, len(output_content) > 0
+            # Check if this could be a valid end tag start
+            remaining = delta_text[lt_pos:]
+            if len(remaining) == 1:  # Just '<' - could be followed by '/' in next chunk
+                # Start buffering - we'll quickly fail if next chunk doesn't start with '/'
+                self.buffering_xml = True
+                self.xml_buffer = remaining
+                return output_content, len(output_content) > 0
+            else:
+                # More content after '<', check if it looks like an end tag
+                if remaining.startswith('</'):
+                    # This is an end tag, start buffering
+                    self.buffering_xml = True
+                    self.xml_buffer = remaining
+                    return output_content, len(output_content) > 0
+                else:
+                    # Not an end tag, pass through
+                    return delta_text, True
         
         else:
             # No special characters, pass through
@@ -714,6 +780,10 @@ class Qwen3CoderToolParser(ToolParser):
                     # End of parameter
                     end_idx = effective_delta_text.find(self.parameter_end_token)
                     value_chunk = effective_delta_text[:end_idx]
+                    
+                    # Remove trailing newline if it exists
+                    if value_chunk[-1] == "\n":
+                        value_chunk = value_chunk[:-1]
 
                     # Skip past > if at start
                     if not self.current_param_value and ">" in value_chunk:
