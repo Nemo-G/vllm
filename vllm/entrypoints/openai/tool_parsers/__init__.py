@@ -3,6 +3,7 @@
 
 from .abstract_tool_parser import ToolParser, ToolParserManager
 from .deepseekv3_tool_parser import DeepSeekV3ToolParser
+from .deepseekv3_1_tool_parser import DeepSeekV3_1ToolParser
 from .glm4_moe_tool_parser import Glm4MoeModelToolParser
 from .granite_20b_fc_tool_parser import Granite20bFCToolParser
 from .granite_tool_parser import GraniteToolParser
@@ -35,6 +36,7 @@ __all__ = [
     "PythonicToolParser",
     "Phi4MiniJsonToolParser",
     "DeepSeekV3ToolParser",
+    "DeepSeekV3_1ToolParser",
     "xLAMToolParser",
     "MinimaxToolParser",
     "KimiK2ToolParser",
