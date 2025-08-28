@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import ast
+
 import json
 import uuid
 from collections.abc import Sequence
@@ -22,7 +22,7 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer
 logger = init_logger(__name__)
 
 
-@ToolParserManager.register_module("qwen3_coder")
+@ToolParserManager.register_module(["qwen3_coder"])
 class Qwen3CoderToolParser(ToolParser):
 
     def __init__(self, tokenizer: AnyTokenizer):
@@ -30,8 +30,6 @@ class Qwen3CoderToolParser(ToolParser):
 
         self.current_tool_name_sent: bool = False
         self.prev_tool_call_arr: list[dict] = []
-        # Override base class type - we use string IDs for tool calls
-        self.current_tool_id: Optional[str] = None  # type: ignore
         self.streamed_args_for_tool: list[str] = []
 
         # Sentinel tokens for streaming mode
@@ -44,6 +42,24 @@ class Qwen3CoderToolParser(ToolParser):
         self.is_tool_call_started: bool = False
         self.failed_count: int = 0
 
+        # Streaming state variables
+        self.current_tool_index: int = 0
+        self.header_sent: bool = False
+        self.current_tool_string_id: Optional[str] = None
+        self.current_function_name: Optional[str] = None
+        self.current_param_name: Optional[str] = None
+        self.current_param_value: str = ""
+        self.param_count: int = 0
+        self.in_param: bool = False
+        self.in_function: bool = False
+        self.accumulated_text: str = ""
+        self.json_started: bool = False
+        self.json_closed: bool = False
+
+        # Buffering for partial XML tags
+        self.xml_buffer: str = ""
+        self.buffering_xml: bool = False
+
         # Enhanced streaming state - reset for each new message
         self._reset_streaming_state()
 
@@ -55,8 +71,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
-            re.DOTALL)
+            r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL)
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -73,8 +88,8 @@ class Qwen3CoderToolParser(ToolParser):
                 "Qwen3 XML Tool parser could not locate tool call start/end "
                 "tokens in the tokenizer!")
 
-        logger.info("vLLM Successfully import tool parser %s !",
-                    self.__class__.__name__)
+        logger.debug("vLLM Successfully import tool parser %s !",
+                     self.__class__.__name__)
 
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
@@ -85,7 +100,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.current_tool_index = 0
         self.is_tool_call_started = False
         self.header_sent = False
-        self.current_tool_id = None
+        self.current_tool_string_id = None
         self.current_function_name = None
         self.current_param_name = None
         self.current_param_value = ""
@@ -95,323 +110,303 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_text = ""
         self.json_started = False
         self.json_closed = False
-        # Store accumulated parameters for type conversion
-        self.accumulated_params = {}
-        self.streaming_request = None
-        # XML buffering state
         self.xml_buffer = ""
         self.buffering_xml = False
 
     def _process_xml_buffer(self, delta_text: str) -> tuple[str, bool]:
         """
-        Process XML buffering using state machine to handle partial end tags.
-        
-        State Machine:
-        - NORMAL: Not buffering, pass through regular content
-        - BUFFERING: Accumulating potential XML end tag or newline+end tag
-        - QUICK_FAIL: Invalid pattern detected, flush buffer and continue
+        Process XML buffering to handle partial end tags and newlines.
+
+        Key principle: ALWAYS split at newlines and buffer them, then check if
+        they're followed by end tags to determine if they should be stripped.
 
         Returns:
             tuple[str, bool]: (processed_delta_text, should_continue_processing)
+            - processed_delta_text: The delta text after buffering processing
+            - should_continue_processing: Whether to continue processing
         """
-        # State machine states
-        NORMAL = 0
-        BUFFERING = 1
-        QUICK_FAIL = 2
-        
         # Known end tokens we need to buffer for
         end_tokens = [self.parameter_end_token, self.function_end_token, self.tool_call_end_token]
 
-        # Determine current state
-        state = BUFFERING if self.buffering_xml else NORMAL
-        
-        # Fast path: If not buffering and no special chars, pass through immediately
-        if state == NORMAL and '<' not in delta_text and '\n' not in delta_text:
-            return delta_text, True
-
-        # Fast path: Complete end tokens when not buffering
-        # These are XML structural elements, not content for arguments
-        if state == NORMAL:
+        # If we're not buffering, check for complete end tokens first
+        if not self.buffering_xml:
             for token in end_tokens:
                 if delta_text == token:
-                    return "", False  # Don't output XML end tags as content
-        
-        # State machine processing
-        if state == BUFFERING:
-            # Add new input to buffer
+                    # Complete end token, pass through immediately
+                    return delta_text, True
+
+        # If we're not buffering and delta has no special characters, pass through
+        if not self.buffering_xml and '<' not in delta_text and '\n' not in delta_text:
+            return delta_text, True
+
+        output_content = ""
+
+        # If we're already buffering, process the new delta
+        if self.buffering_xml:
+            # Add new delta to buffer
             self.xml_buffer += delta_text
 
-            # Check for complete valid end tokens
+            # Check if we now have a complete end token
             for token in end_tokens:
-                if self.xml_buffer == token or self.xml_buffer == '\n' + token:
-                    # Valid complete end token found - DO NOT output as content!
-                    # These are XML structural elements, not content for the arguments
-                    self._reset_buffer()
-                    return "", False  # Return empty string, don't continue processing
-            
-            # Quick fail checks - strict patterns that cannot be valid end tags
-            state = self._check_quick_fail_patterns()
-            
-            if state == QUICK_FAIL:
-                return self._handle_quick_fail()
-            
-            # Check if buffer could still become a valid end token
-            if self._could_be_valid_end_token():
-                # Continue buffering if reasonable length
-                max_len = max(len(token) for token in end_tokens) + 1  # +1 for potential newline
-                if len(self.xml_buffer) <= max_len:
-                    return "", False  # Keep buffering
-                else:
-                    # Buffer too long, force fail
-                    state = QUICK_FAIL
-                    return self._handle_quick_fail()
-            else:
-                # Invalid pattern, quick fail
-                state = QUICK_FAIL
-                return self._handle_quick_fail()
-        
-        else:  # state == NORMAL
-            # Check if we need to start buffering
-            return self._check_start_buffering(delta_text)
-    
-    def _reset_buffer(self):
-        """Reset XML buffering state."""
-        self.xml_buffer = ""
-        self.buffering_xml = False
-    
-    def _check_quick_fail_patterns(self) -> int:
-        """
-        Check for patterns that definitely cannot be valid end tags.
-        Returns state: BUFFERING or QUICK_FAIL.
-        """
-        BUFFERING = 1
-        QUICK_FAIL = 2
-        
-        # Pattern 1: '<' not followed by '/' - definitely not an end tag
-        if self.xml_buffer == '<' and len(self.xml_buffer) > 1:
-            next_char = self.xml_buffer[1]
-            if next_char != '/':
-                return QUICK_FAIL
-        
-        # Pattern 2: '\n' followed by non-'<' character - not an end tag
-        if self.xml_buffer.startswith('\n') and len(self.xml_buffer) > 1:
-            if not self.xml_buffer[1:].startswith('<'):
-                return QUICK_FAIL
-        
-        # Pattern 3: Invalid XML characters in what should be tag content
-        if self.xml_buffer.startswith('<') and len(self.xml_buffer) > 1:
-            # After '</', we should only see valid tag name characters
-            if self.xml_buffer.startswith('</'):
-                tag_content = self.xml_buffer[2:]  # Skip '</'
-                # Check for invalid characters that can't be in tag names
-                invalid_chars = {' ', '\t', '\n', '{', '}', '"', "'", '&'}
-                for char in tag_content:
-                    if char == '>' and tag_content.endswith('>'):
-                        # Valid end of tag
-                        break
-                    if char in invalid_chars:
-                        return QUICK_FAIL
-        
-        return BUFFERING
-    
-    def _could_be_valid_end_token(self) -> bool:
-        """Check if current buffer could still become a valid end token."""
-        end_tokens = [self.parameter_end_token, self.function_end_token, self.tool_call_end_token]
-        
-        # Check direct matches
-        for token in end_tokens:
-            if token.startswith(self.xml_buffer):
-                return True
-            # Also check newline + token pattern
-            if ('\n' + token).startswith(self.xml_buffer):
-                return True
-        
-        return False
-    
-    def _handle_quick_fail(self) -> tuple[str, bool]:
-        """Handle quick fail case - output buffer and continue processing."""
-        # Find the boundary between original buffer and new delta
-        # We need to be smart about this to handle recursive buffering
-        result = self.xml_buffer
-        self._reset_buffer()
-        
-        # Check if the failed content itself contains patterns that need buffering
-        if '<' in result or '\n' in result:
-            # Find the last occurrence of special chars to potentially start new buffering
-            last_newline = result.rfind('\n')
-            last_lt = result.rfind('<')
-            
-            split_pos = max(last_newline, last_lt)
-            
-            if split_pos > 0:
-                output_part = result[:split_pos]
-                potential_buffer = result[split_pos:]
-                
-                # Check if potential_buffer should start new buffering
-                if self._should_start_buffering(potential_buffer):
+                if self.xml_buffer == token:
+                    # Complete end token, output it
+                    self.buffering_xml = False
+                    result = self.xml_buffer
+                    self.xml_buffer = ""
+                    return result, True
+
+            # Check if we have newline + complete end token (preserve the newline)
+            for token in end_tokens:
+                if self.xml_buffer == '\n' + token:
+                    # Newline + end token, output both
+                    self.buffering_xml = False
+                    result = self.xml_buffer
+                    self.xml_buffer = ""
+                    return result, True
+
+            # Quick fail: if buffer is just '<' and new input doesn't start with '/'
+            if self.xml_buffer == '<' and not delta_text.startswith('/'):
+                # Not an end tag, output buffered '<' and process delta normally
+                self.buffering_xml = False
+                buffered_content = self.xml_buffer
+                self.xml_buffer = ""
+
+                # Process the delta_text normally (it might contain more special chars)
+                delta_result, delta_continue = self._process_xml_buffer(delta_text)
+                return buffered_content + delta_result, delta_continue
+
+            # Check if buffer could still become valid
+            could_be_valid = False
+            for token in end_tokens:
+                if token.startswith(self.xml_buffer) or ('\n' + token).startswith(self.xml_buffer):
+                    could_be_valid = True
+                    break
+
+            # Quick fail: if buffer starts with newline and next part doesn't look like end tag
+            if (self.xml_buffer.startswith('\n') and len(self.xml_buffer) > 1 and
+                not self.xml_buffer[1:].startswith('<')):
+                could_be_valid = False
+
+                # Quick fail detected - need to handle additional newlines in the input
+                self.buffering_xml = False
+
+                # Find where the original buffer ended and new delta started
+                original_buffer_len = len(self.xml_buffer) - len(delta_text)
+                buffered_part = self.xml_buffer[:original_buffer_len]  # Just the original "\n"
+                delta_part = self.xml_buffer[original_buffer_len:]     # The new delta_text
+
+                self.xml_buffer = ""
+
+                # Check if delta_part contains newlines that need new buffering
+                if '\n' in delta_part:
+                    newline_pos = delta_part.find('\n')
+                    content_before_newline = delta_part[:newline_pos]
+                    content_from_newline = delta_part[newline_pos:]
+
+                    # Output buffered newline + content before new newline
+                    output_result = buffered_part + content_before_newline
+
+                    # Start new buffering from the newline
                     self.buffering_xml = True
-                    self.xml_buffer = potential_buffer
-                    # Always continue processing when buffering starts, even if no output content
-                    return output_part, True
-        
-        return result, True
+                    self.xml_buffer = content_from_newline
 
-    def _check_start_buffering(self, delta_text: str) -> tuple[str, bool]:
-        """Check if we should start buffering based on delta_text."""
-        # Look for newlines - always buffer after newlines
+                    return output_result, len(output_result) > 0
+                else:
+                    # No additional newlines, output everything
+                    return buffered_part + delta_part, True
+
+            max_reasonable_len = max(len(token) for token in end_tokens) + 2  # +2 for newline + some margin
+            if could_be_valid and len(self.xml_buffer) <= max_reasonable_len:
+                # Keep buffering
+                return "", False
+            else:
+                # Buffer is invalid or too long
+                self.buffering_xml = False
+
+                # Check if this is due to invalid XML structure (not newline-related)
+                if not could_be_valid and not self.xml_buffer.startswith('\n'):
+                    # Extract original buffer and new delta
+                    original_buffer_len = len(self.xml_buffer) - len(delta_text)
+                    original_buffer = self.xml_buffer[:original_buffer_len]
+
+                    # Check if new delta should start new buffering
+                    if '<' in delta_text or '\n' in delta_text:
+                        # Start new buffering with the delta
+                        self.buffering_xml = True
+                        self.xml_buffer = delta_text
+                        return original_buffer, len(original_buffer) > 0
+                    else:
+                        # No special chars in delta, output everything
+                        result = self.xml_buffer
+                        self.xml_buffer = ""
+                        return result, True
+                else:
+                    # Output entire buffer for other cases (too long, etc.)
+                    result = self.xml_buffer
+                    self.xml_buffer = ""
+                    return result, True
+
+        # Not currently buffering - check if we need to start
         if '\n' in delta_text:
+            # ALWAYS split at newlines - this is the key fix
             newline_pos = delta_text.find('\n')
-            output_content = delta_text[:newline_pos]
-            buffer_content = delta_text[newline_pos:]
+            output_content = delta_text[:newline_pos]  # Everything before first newline
 
+            # Start buffering from the newline onwards
             self.buffering_xml = True
-            self.xml_buffer = buffer_content
-            # Always continue processing when buffering starts, even if no output content
-            return output_content, True
+            self.xml_buffer = delta_text[newline_pos:]
 
-        # Look for '<' character  
+            # Return output and indicate we should NOT continue processing
+            # (because we're now buffering)
+            return output_content, len(output_content) > 0
+
         elif '<' in delta_text:
+            # Found start of XML tag
             lt_pos = delta_text.find('<')
             output_content = delta_text[:lt_pos]
-            potential_tag = delta_text[lt_pos:]
 
-            if self._should_start_buffering(potential_tag):
+            # Check if this could be a valid end tag start
+            remaining = delta_text[lt_pos:]
+            if len(remaining) == 1:  # Just '<' - could be followed by '/' in next chunk
+                # Start buffering - we'll quickly fail if next chunk doesn't start with '/'
                 self.buffering_xml = True
-                self.xml_buffer = potential_tag
-                # Always continue processing when buffering starts, even if no output content
-                return output_content, True
-        
-        # No special patterns, pass through
-            return delta_text, True
-    
-    def _should_start_buffering(self, text: str) -> bool:
-        """Determine if text should start buffering process."""
-        # Always buffer newlines (could be followed by end tags)
-        if text.startswith('\n'):
-            return True
-            
-        # Buffer potential end tags
-        if text.startswith('</'):
-            return True
-            
-        # Buffer single '<' (could be start of end tag in next chunk)
-        if text == '<':
-            return True
-            
-        return False
-
-    def _get_arguments_config(
-            self, func_name: str,
-            tools: Optional[list[ChatCompletionToolsParam]]) -> dict:
-        """Extract argument configuration for a function."""
-        if tools is None:
-            return {}
-        for config in tools:
-            if not hasattr(config, "type") or not (hasattr(
-                    config, "function") and hasattr(config.function, "name")):
-                continue
-            if config.type == "function" and config.function.name == func_name:
-                if not hasattr(config.function, "parameters"):
-                    return {}
-                params = config.function.parameters
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
-                    return params
+                self.xml_buffer = remaining
+                return output_content, len(output_content) > 0
+            else:
+                # More content after '<', check if it looks like an end tag
+                if remaining.startswith('</'):
+                    # This is an end tag, start buffering
+                    self.buffering_xml = True
+                    self.xml_buffer = remaining
+                    return output_content, len(output_content) > 0
                 else:
-                    return {}
-        logger.warning("Tool '%s' is not defined in the tools list.",
-                       func_name)
-        return {}
+                    # Not an end tag, pass through
+                    return delta_text, True
 
-    def _convert_param_value(self, param_value: str, param_name: str,
-                             param_config: dict, func_name: str) -> Any:
-        """Convert parameter value based on its type in the schema."""
-        # Handle null value for any type
-        if param_value.lower() == "null":
-            return None
-
-        if param_name not in param_config:
-            if param_config != {}:
-                logger.warning(
-                    "Parsed parameter '%s' is not defined in the tool "
-                    "parameters for tool '%s', directly returning the "
-                    "string value.", param_name, func_name)
-            return param_value
-
-        if isinstance(param_config[param_name],
-                      dict) and "type" in param_config[param_name]:
-            param_type = str(param_config[param_name]["type"]).strip().lower()
         else:
-            param_type = "string"
-        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-            return param_value
-        elif param_type.startswith("int") or param_type.startswith(
-                "uint") or param_type.startswith(
-                    "long") or param_type.startswith(
-                        "short") or param_type.startswith("unsigned"):
-            try:
-                return int(param_value)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not an "
-                    "integer in tool '%s', degenerating to string.",
-                    param_value, param_name, func_name)
-                return param_value
-        elif param_type.startswith("num") or param_type.startswith("float"):
-            try:
-                float_param_value = float(param_value)
-                return float_param_value if float_param_value - int(
-                    float_param_value) != 0 else int(float_param_value)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not a float "
-                    "in tool '%s', degenerating to string.", param_value,
-                    param_name, func_name)
-                return param_value
-        elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
-                logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not a boolean "
-                    "(`true` or `false`) in tool '%s', degenerating to "
-                    "false.", param_value, param_name, func_name)
-            return param_value == "true"
-        else:
-            if param_type in ["object", "array", "arr"
-                              ] or param_type.startswith(
-                                  "dict") or param_type.startswith("list"):
-                try:
-                    param_value = json.loads(param_value)
-                    return param_value
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' cannot be "
-                        "parsed with json.loads in tool '%s', will try "
-                        "other methods to parse it.", param_value, param_name,
-                        func_name)
-            try:
-                param_value = ast.literal_eval(param_value)  # safer
-            except (ValueError, SyntaxError, TypeError):
-                logger.warning(
-                    "Parsed value '%s' of parameter '%s' cannot be "
-                    "converted via Python `ast.literal_eval()` in tool "
-                    "'%s', degenerating to string.", param_value, param_name,
-                    func_name)
-            return param_value
+            # No special characters, pass through
+            return delta_text, True
 
     def _parse_xml_function_call(
             self, function_call_str: str,
             tools: Optional[list[ChatCompletionToolsParam]]
     ) -> Optional[ToolCall]:
 
+        def get_arguments_config(func_name: str) -> dict:
+            if tools is None:
+                return {}
+            for config in tools:
+                if not hasattr(config, "type") or not (
+                        hasattr(config, "function")
+                        and hasattr(config.function, "name")):
+                    continue
+                if (config.type == "function"
+                        and config.function.name == func_name):
+                    if not hasattr(config.function, "parameters"):
+                        return {}
+                    params = config.function.parameters
+                    if isinstance(params, dict) and "properties" in params:
+                        return params["properties"]
+                    elif isinstance(params, dict):
+                        return params
+                    else:
+                        return {}
+            logger.warning("Tool '%s' is not defined in the tools list.",
+                           func_name)
+            return {}
+
+        def convert_param_value(param_value: str, param_name: str,
+                                param_config: dict, func_name: str) -> Any:
+            # Handle null value for any type
+            if param_value.lower() == "null":
+                return None
+
+            converted_value: Any
+
+            if param_name not in param_config:
+                if param_config != {}:
+                    logger.warning(
+                        "Parsed parameter '%s' is not defined in the tool "
+                        "parameters for tool '%s', directly returning the "
+                        "string value.", param_name, func_name)
+                return param_value
+
+            if (isinstance(param_config[param_name], dict)
+                    and "type" in param_config[param_name]):
+                param_type = str(
+                    param_config[param_name]["type"]).strip().lower()
+            else:
+                param_type = "string"
+            if param_type in [
+                    "string", "str", "text", "varchar", "char", "enum"
+            ]:
+                return param_value
+            elif (param_type.startswith("int") or param_type.startswith("uint")
+                  or param_type.startswith("long")
+                  or param_type.startswith("short")
+                  or param_type.startswith("unsigned")):
+                try:
+                    converted_value = int(param_value)
+                    return converted_value
+                except ValueError:
+                    logger.warning(
+                        "Parsed value '%s' of parameter '%s' is not an "
+                        "integer in tool '%s', degenerating to string.",
+                        param_value, param_name, func_name)
+                return param_value
+            elif (param_type.startswith("num")
+                  or param_type.startswith("float")):
+                try:
+                    float_param_value = float(param_value)
+                    converted_value = (float_param_value if float_param_value -
+                                       int(float_param_value) != 0 else
+                                       int(float_param_value))
+                    return converted_value
+                except ValueError:
+                    logger.warning(
+                        "Parsed value '%s' of parameter '%s' is not a float "
+                        "in tool '%s', degenerating to string.", param_value,
+                        param_name, func_name)
+                return param_value
+            elif param_type in ["boolean", "bool", "binary"]:
+                param_value = param_value.lower()
+                if param_value not in ["true", "false"]:
+                    logger.warning(
+                        "Parsed value '%s' of parameter '%s' is not a "
+                        "boolean (`true` of `false`) in tool '%s', "
+                        "degenerating to false.", param_value, param_name,
+                        func_name)
+                return param_value == "true"
+            else:
+                if param_type == "object" or param_type.startswith("dict"):
+                    try:
+                        converted_value = json.loads(param_value)
+                        return converted_value
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Parsed value '%s' of parameter '%s' is not a "
+                            "valid JSON object in tool '%s', will try other "
+                            "methods to parse it.", param_value, param_name,
+                            func_name)
+                try:
+                    converted_value = eval(param_value)
+                    return converted_value
+                except Exception:
+                    logger.warning(
+                        "Parsed value '%s' of parameter '%s' cannot be "
+                        "converted via Python `eval()` in tool '%s', "
+                        "degenerating to string.", param_value, param_name,
+                        func_name)
+                return param_value
+
         # Extract function name
         end_index = function_call_str.index(">")
         function_name = function_call_str[:end_index]
-        param_config = self._get_arguments_config(function_name, tools)
+        param_config = get_arguments_config(function_name)
         parameters = function_call_str[end_index + 1:]
         param_dict = {}
-        for match_text in self.tool_call_parameter_regex.findall(parameters):
+        for match in self.tool_call_parameter_regex.findall(parameters):
+            match_text = match[0] if match[0] else match[1]
             idx = match_text.index(">")
             param_name = match_text[:idx]
             param_value = str(match_text[idx + 1:])
@@ -421,7 +416,7 @@ class Qwen3CoderToolParser(ToolParser):
             if param_value.endswith("\n"):
                 param_value = param_value[:-1]
 
-            param_dict[param_name] = self._convert_param_value(
+            param_dict[param_name] = convert_param_value(
                 param_value, param_name, param_config, function_name)
         return ToolCall(
             type="function",
@@ -474,7 +469,8 @@ class Qwen3CoderToolParser(ToolParser):
                 for function_call_str in function_calls
             ]
 
-            # Populate prev_tool_call_arr for serving layer to set finish_reason
+            # Populate prev_tool_call_arr for serving layer to set
+            # finish_reason
             self.prev_tool_call_arr.clear()  # Clear previous calls
             for tool_call in tool_calls:
                 if tool_call:
@@ -487,8 +483,8 @@ class Qwen3CoderToolParser(ToolParser):
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
-            idx = model_output.find(self.tool_call_prefix)
-            content_index = content_index if content_index >= 0 else idx
+            content_index = (content_index if content_index >= 0 else
+                             model_output.find(self.tool_call_prefix))
             content = model_output[:content_index]  # .rstrip()
 
             return ExtractedToolCallInformation(
@@ -513,16 +509,13 @@ class Qwen3CoderToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
-        # Store request for type conversion
-        if not previous_text:
-            self._reset_streaming_state()
-            self.streaming_request = request
-
-        # If no delta text, return None unless it's an EOS token after tools
+        # If no delta text, return None unless it's an EOS token after tool
+        # calls
         if not delta_text:
             # Check if this is an EOS token after all tool calls are complete
-            # Check for tool calls in text even if is_tool_call_started
-            # is False (might have been reset after processing all tools)
+            # We check for tool calls in the text even if is_tool_call_started
+            # is False because it might have been reset after processing all
+            # tools
             if (delta_token_ids
                     and self.tool_call_end_token_id not in delta_token_ids):
                 # Count complete tool calls
@@ -531,18 +524,23 @@ class Qwen3CoderToolParser(ToolParser):
 
                 # If we have completed tool calls and populated
                 # prev_tool_call_arr
-                if complete_calls > 0 and len(self.prev_tool_call_arr) > 0:
+                if (complete_calls > 0 and len(self.prev_tool_call_arr) > 0):
                     # Check if all tool calls are closed
-                    open_calls = current_text.count(
-                        self.tool_call_start_token) - current_text.count(
-                            self.tool_call_end_token)
+                    open_calls = (
+                        current_text.count(self.tool_call_start_token) -
+                        current_text.count(self.tool_call_end_token))
                     if open_calls == 0:
-                        # Return empty delta for finish_reason processing
+                        # Return empty delta message to allow finish_reason
+                        # processing
                         return DeltaMessage(content="")
                 elif not self.is_tool_call_started and current_text:
                     # This is a regular content response that's now complete
                     return DeltaMessage(content="")
             return None
+
+        # Check if this is the first call (reset state if needed)
+        if not previous_text:
+            self._reset_streaming_state()
 
         # Update accumulated text
         self.accumulated_text = current_text
@@ -568,14 +566,15 @@ class Qwen3CoderToolParser(ToolParser):
                 self.param_count = 0
                 self.json_started = False
                 self.json_closed = False
-                self.accumulated_params = {}
                 self.in_param = False
                 self.current_param_value = ""
-                # Note: XML buffer state is managed by the state machine, no manual reset needed
+                self.xml_buffer = ""
+                self.buffering_xml = False
 
                 # Check if there are more tool calls
-                tool_starts = current_text.count(self.tool_call_start_token)
-                if self.current_tool_index >= tool_starts:
+                tool_starts_count = current_text.count(
+                    self.tool_call_start_token)
+                if self.current_tool_index >= tool_starts_count:
                     # No more tool calls
                     self.is_tool_call_started = False
                 # Continue processing next tool
@@ -612,20 +611,20 @@ class Qwen3CoderToolParser(ToolParser):
 
         # We're in a tool call, find the current tool call portion
         # Need to find the correct tool call based on current_tool_index
-        tool_start_positions: list[int] = []
+        tool_starts: list[int] = []
         idx = 0
         while True:
             idx = current_text.find(self.tool_call_start_token, idx)
             if idx == -1:
                 break
-            tool_start_positions.append(idx)
+            tool_starts.append(idx)
             idx += len(self.tool_call_start_token)
 
-        if self.current_tool_index >= len(tool_start_positions):
+        if self.current_tool_index >= len(tool_starts):
             # No more tool calls to process yet
             return None
 
-        tool_start_idx = tool_start_positions[self.current_tool_index]
+        tool_start_idx = tool_starts[self.current_tool_index]
         # Find where this tool call ends (or current position if not ended yet)
         tool_end_idx = current_text.find(self.tool_call_end_token,
                                          tool_start_idx)
@@ -638,19 +637,19 @@ class Qwen3CoderToolParser(ToolParser):
         # Looking for function header
         if not self.header_sent:
             if self.tool_call_prefix in tool_text:
-                func_start = tool_text.find(self.tool_call_prefix) + len(
-                    self.tool_call_prefix)
+                func_start = (tool_text.find(self.tool_call_prefix) +
+                              len(self.tool_call_prefix))
                 func_end = tool_text.find(">", func_start)
 
                 if func_end != -1:
                     # Found complete function name
                     self.current_function_name = tool_text[func_start:func_end]
-                    self.current_tool_id = self._generate_tool_call_id()
+                    self.current_tool_string_id = self._generate_tool_call_id()
                     self.header_sent = True
                     self.in_function = True
 
-                    # IMPORTANT: Add to prev_tool_call_arr immediately when
-                    # we detect a tool call. This ensures
+                    # IMPORTANT: Add to prev_tool_call_arr immediately when we
+                    # detect a tool call. This ensures
                     # finish_reason="tool_calls" even if parsing isn't complete
                     already_added = any(
                         tool.get("name") == self.current_function_name
@@ -666,7 +665,7 @@ class Qwen3CoderToolParser(ToolParser):
                     return DeltaMessage(tool_calls=[
                         DeltaToolCall(
                             index=self.current_tool_index,
-                            id=self.current_tool_id,
+                            id=self.current_tool_string_id,
                             function=DeltaFunctionCall(
                                 name=self.current_function_name, arguments=""),
                             type="function",
@@ -696,11 +695,10 @@ class Qwen3CoderToolParser(ToolParser):
                 # Close JSON
                 self.json_closed = True
 
-                # Extract complete tool call to update
-                # prev_tool_call_arr with final arguments
-                # Find the function content
-                func_start = tool_text.find(self.tool_call_prefix) + len(
-                    self.tool_call_prefix)
+                # Extract the complete tool call to update prev_tool_call_arr
+                # with final arguments. Find the function content
+                func_start = (tool_text.find(self.tool_call_prefix) +
+                              len(self.tool_call_prefix))
                 func_content_end = tool_text.find(self.function_end_token,
                                                   func_start)
                 if func_content_end != -1:
@@ -708,17 +706,15 @@ class Qwen3CoderToolParser(ToolParser):
                     # Parse to get the complete arguments
                     try:
                         parsed_tool = self._parse_xml_function_call(
-                            func_content, self.streaming_request.tools
-                            if self.streaming_request else None)
+                            func_content, request.tools if request else None)
                         if parsed_tool:
-                            # Update existing entry in
-                            # prev_tool_call_arr with complete args
+                            # Update existing entry in prev_tool_call_arr with
+                            # complete arguments
                             for i, tool in enumerate(self.prev_tool_call_arr):
-                                if tool.get(
-                                        "name") == parsed_tool.function.name:
-                                    args = parsed_tool.function.arguments
-                                    self.prev_tool_call_arr[i][
-                                        "arguments"] = args
+                                if (tool.get("name") ==
+                                        parsed_tool.function.name):
+                                    self.prev_tool_call_arr[i]["arguments"] = (
+                                        parsed_tool.function.arguments)
                                     break
                     except Exception:
                         pass  # Ignore parsing errors during streaming
@@ -733,7 +729,6 @@ class Qwen3CoderToolParser(ToolParser):
                 # Reset state for next tool
                 self.in_function = False
                 self.json_closed = True
-                self.accumulated_params = {}
 
                 return result
 
@@ -781,79 +776,30 @@ class Qwen3CoderToolParser(ToolParser):
 
             # Continue parameter value
             if self.in_param:
-                # Check if parameter is ending in this delta
-                # Check for newline + parameter end token first (common case for empty parameters)
-                if '\n' + self.parameter_end_token in effective_delta_text:
-                    # End of parameter with newline
-                    end_idx = effective_delta_text.find('\n' + self.parameter_end_token)
-                    value_chunk = effective_delta_text[:end_idx]
-
-                    # Skip past > if at start
-                    if not self.current_param_value and ">" in value_chunk:
-                        gt_idx = value_chunk.find(">")
-                        value_chunk = value_chunk[gt_idx + 1:]
-
-                    # Remove leading newline for first chunk
-                    if (not self.current_param_value
-                            and value_chunk.startswith("\n")):
-                        value_chunk = value_chunk[1:]
-                    
-                    # Remove trailing newline before end tag
-                    if value_chunk.endswith("\n"):
-                        value_chunk = value_chunk[:-1]
-
-                    # Calculate incremental JSON - handle empty value case
-                    if not self.current_param_value and not value_chunk:
-                        # Empty parameter value - just close the quote
-                        delta_escaped = ""
-                    else:
-                        full_value = self.current_param_value + value_chunk
-                        prev_escaped = (json.dumps(self.current_param_value)[1:-1]
-                                        if self.current_param_value else "")
-                        full_escaped = json.dumps(full_value)[1:-1]
-                        delta_escaped = full_escaped[len(prev_escaped):]
-
-                    self.in_param = False
-                    self.current_param_value = ""
-                    self.param_count += 1  # Increment parameter count
-
-                    return DeltaMessage(tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(
-                                arguments=delta_escaped + '"'),
-                        )
-                    ])
-                # Then check for standard parameter end token
-                elif self.parameter_end_token in effective_delta_text:
+                if self.parameter_end_token in effective_delta_text:
                     # End of parameter
                     end_idx = effective_delta_text.find(self.parameter_end_token)
                     value_chunk = effective_delta_text[:end_idx]
 
+                    # Remove trailing newline if it exists
+                    if value_chunk[-1] == "\n":
+                        value_chunk = value_chunk[:-1]
+
                     # Skip past > if at start
                     if not self.current_param_value and ">" in value_chunk:
                         gt_idx = value_chunk.find(">")
                         value_chunk = value_chunk[gt_idx + 1:]
 
-                    # Remove leading newline for first chunk
                     if (not self.current_param_value
                             and value_chunk.startswith("\n")):
                         value_chunk = value_chunk[1:]
-                    
-                    # Remove trailing newline before end tag
-                    if value_chunk.endswith("\n"):
-                        value_chunk = value_chunk[:-1]
 
-                    # Calculate incremental JSON - handle empty value case
-                    if not self.current_param_value and not value_chunk:
-                        # Empty parameter value - just close the quote
-                        delta_escaped = ""
-                    else:
-                        full_value = self.current_param_value + value_chunk
-                        prev_escaped = (json.dumps(self.current_param_value)[1:-1]
-                                        if self.current_param_value else "")
-                        full_escaped = json.dumps(full_value)[1:-1]
-                        delta_escaped = full_escaped[len(prev_escaped):]
+                    # Calculate incremental JSON
+                    full_value = self.current_param_value + value_chunk
+                    prev_escaped = (json.dumps(self.current_param_value)[1:-1]
+                                    if self.current_param_value else "")
+                    full_escaped = json.dumps(full_value)[1:-1]
+                    delta_escaped = full_escaped[len(prev_escaped):]
 
                     self.in_param = False
                     self.current_param_value = ""
@@ -869,7 +815,7 @@ class Qwen3CoderToolParser(ToolParser):
                 else:
                     # Continue accumulating value
                     value_chunk = effective_delta_text
-                    
+
                     # Handle first chunk after param name
                     if not self.current_param_value and ">" in value_chunk:
                         gt_idx = value_chunk.find(">")
